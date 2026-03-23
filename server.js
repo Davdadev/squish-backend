@@ -71,7 +71,7 @@ app.post('/api/checkout', async (req, res) => {
         key: 'pickup_note',
         label: { type: 'custom', custom: 'Pickup location' },
         type: 'text',
-        text: { default_value: "Narre Warren South — we'll contact you to arrange" },
+        text: { default_value: "email me at david.sebbag2010@gmail.com" },
       }];
     } else {
       // ── DELIVERY: address + shipping options ──
