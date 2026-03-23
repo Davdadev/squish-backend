@@ -45,13 +45,17 @@ app.post('/api/checkout', async (req, res) => {
   if (!ids || !ids.length) return res.status(400).json({ error: 'Missing priceId(s)' });
 
   try {
-    // Build line items — one per price ID
-    const line_items = ids.map(id => ({ price: id, quantity: 1 }));
+    // Count quantities per price ID
+    const qtyCounts = {};
+    for (const id of ids) qtyCounts[id] = (qtyCounts[id] || 0) + 1;
 
-    // Calculate total to decide if free shipping applies
-    // We look up each price to sum the amounts
-    const prices = await Promise.all(ids.map(id => stripe.prices.retrieve(id)));
-    const totalCents = prices.reduce((sum, p) => sum + (p.unit_amount || 0), 0);
+    // Build line items with proper quantity (shows as "x3" in Stripe, not 3 rows)
+    const line_items = Object.entries(qtyCounts).map(([price, quantity]) => ({ price, quantity }));
+
+    // Calculate total for free shipping check
+    const uniqueIds = Object.keys(qtyCounts);
+    const prices = await Promise.all(uniqueIds.map(id => stripe.prices.retrieve(id)));
+    const totalCents = prices.reduce((sum, p) => sum + (p.unit_amount || 0) * qtyCounts[p.id], 0);
     const qualifiesForFreeShipping = totalCents >= FREE_SHIPPING_THRESHOLD;
 
     const sessionParams = {
