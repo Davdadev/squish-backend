@@ -7,6 +7,8 @@ const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const app    = express();
 const PORT   = process.env.PORT || 3000;
 
+const FREE_SHIPPING_THRESHOLD = 5000; // $50.00 AUD in cents
+
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
@@ -14,6 +16,7 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'Squish Factory backend is running 🎲' });
 });
 
+// ── GET /api/products ─────────────────────────────
 app.get('/api/products', async (req, res) => {
   try {
     const products = await stripe.products.list({ active: true, expand: ['data.default_price'], limit: 100 });
@@ -31,57 +34,102 @@ app.get('/api/products', async (req, res) => {
   }
 });
 
+// ── POST /api/checkout ────────────────────────────
+// Body: { priceIds: ['price_xxx', ...], pickup: bool }
+// priceIds is an array so upsell items can be added
 app.post('/api/checkout', async (req, res) => {
-  const { priceId, pickup } = req.body;
-  if (!priceId) return res.status(400).json({ error: 'Missing priceId' });
+  const { priceIds, priceId, pickup } = req.body;
+
+  // Support both single priceId (legacy) and array priceIds (upsell)
+  const ids = priceIds || (priceId ? [priceId] : null);
+  if (!ids || !ids.length) return res.status(400).json({ error: 'Missing priceId(s)' });
 
   try {
+    // Build line items — one per price ID
+    const line_items = ids.map(id => ({ price: id, quantity: 1 }));
+
+    // Calculate total to decide if free shipping applies
+    // We look up each price to sum the amounts
+    const prices = await Promise.all(ids.map(id => stripe.prices.retrieve(id)));
+    const totalCents = prices.reduce((sum, p) => sum + (p.unit_amount || 0), 0);
+    const qualifiesForFreeShipping = totalCents >= FREE_SHIPPING_THRESHOLD;
+
     const sessionParams = {
       mode: 'payment',
-      line_items: [{ price: priceId, quantity: 1 }],
+      line_items,
       success_url: process.env.SUCCESS_URL || `http://localhost:${PORT}?success=true`,
       cancel_url:  process.env.CANCEL_URL  || `http://localhost:${PORT}?canceled=true`,
     };
 
     if (pickup) {
-      // ── PICKUP: no address, no shipping fees ──
+      // ── PICKUP: no address, no shipping ──
       sessionParams.custom_fields = [{
         key: 'pickup_note',
         label: { type: 'custom', custom: 'Pickup location' },
         type: 'text',
-        text: { default_value: 'email me david.sebbag2010@gmail.com' },
+        text: { default_value: "Narre Warren South — we'll contact you to arrange" },
       }];
     } else {
-      // ── DELIVERY: address + shipping rate options ──
+      // ── DELIVERY: address + shipping options ──
       sessionParams.shipping_address_collection = { allowed_countries: ['AU'] };
-      sessionParams.shipping_options = [
-        {
-          shipping_rate_data: {
-            type: 'fixed_amount',
-            fixed_amount: { amount: 1000, currency: 'aud' }, // $10.00
-            display_name: 'Standard Delivery',
-            delivery_estimate: {
-              minimum: { unit: 'business_day', value: 3 },
-              maximum: { unit: 'business_day', value: 7 },
+
+      if (qualifiesForFreeShipping) {
+        // Order is $50+ — offer free standard, discounted express
+        sessionParams.shipping_options = [
+          {
+            shipping_rate_data: {
+              type: 'fixed_amount',
+              fixed_amount: { amount: 0, currency: 'aud' },
+              display_name: '🎉 Free Standard Delivery (order over $50)',
+              delivery_estimate: {
+                minimum: { unit: 'business_day', value: 3 },
+                maximum: { unit: 'business_day', value: 7 },
+              },
             },
           },
-        },
-        {
-          shipping_rate_data: {
-            type: 'fixed_amount',
-            fixed_amount: { amount: 1500, currency: 'aud' }, // $15.00
-            display_name: 'Express Delivery',
-            delivery_estimate: {
-              minimum: { unit: 'business_day', value: 1 },
-              maximum: { unit: 'business_day', value: 3 },
+          {
+            shipping_rate_data: {
+              type: 'fixed_amount',
+              fixed_amount: { amount: 1500, currency: 'aud' },
+              display_name: 'Express Delivery',
+              delivery_estimate: {
+                minimum: { unit: 'business_day', value: 1 },
+                maximum: { unit: 'business_day', value: 3 },
+              },
             },
           },
-        },
-      ];
+        ];
+      } else {
+        // Under $50 — standard $10, express $15
+        sessionParams.shipping_options = [
+          {
+            shipping_rate_data: {
+              type: 'fixed_amount',
+              fixed_amount: { amount: 1000, currency: 'aud' },
+              display_name: 'Standard Delivery',
+              delivery_estimate: {
+                minimum: { unit: 'business_day', value: 3 },
+                maximum: { unit: 'business_day', value: 7 },
+              },
+            },
+          },
+          {
+            shipping_rate_data: {
+              type: 'fixed_amount',
+              fixed_amount: { amount: 1500, currency: 'aud' },
+              display_name: 'Express Delivery',
+              delivery_estimate: {
+                minimum: { unit: 'business_day', value: 1 },
+                maximum: { unit: 'business_day', value: 3 },
+              },
+            },
+          },
+        ];
+      }
     }
 
     const session = await stripe.checkout.sessions.create(sessionParams);
-    res.json({ sessionId: session.id });
+    res.json({ sessionId: session.id, qualifiesForFreeShipping, totalCents });
   } catch (err) {
     console.error('Checkout error:', err.message);
     res.status(500).json({ error: err.message });
