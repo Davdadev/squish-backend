@@ -93,18 +93,37 @@ app.post('/api/checkout', async (req, res) => {
   if (!normalizedItems.length) return res.status(400).json({ error: 'Missing item(s)' });
 
   try {
-    // Count quantities per price ID for Stripe line_items
+    // Count quantities by price + color so colour selections are preserved per item variant
+    const variantCounts = {};
     const qtyCounts = {};
+
     for (const item of normalizedItems) {
+      const key = `${item.priceId}::${item.color || 'Default'}`;
+      variantCounts[key] = (variantCounts[key] || 0) + item.quantity;
       qtyCounts[item.priceId] = (qtyCounts[item.priceId] || 0) + item.quantity;
     }
 
-    // Build line items with proper quantity (shows as "x3" in Stripe, not 3 rows)
-    const line_items = Object.entries(qtyCounts).map(([price, quantity]) => ({ price, quantity }));
+    // Build line items with adjustable quantities in Stripe Checkout
+    // (lets customers edit item amounts directly in checkout)
+    const line_items = Object.entries(variantCounts).map(([key, quantity]) => {
+      const [price] = key.split('::');
+      return {
+        price,
+        quantity,
+        adjustable_quantity: {
+          enabled: true,
+          minimum: 1,
+          maximum: 99,
+        },
+      };
+    });
 
     // Keep selected colours/quantities for order ops in metadata
-    const optionSummary = normalizedItems
-      .map(item => `${item.priceId}:${item.color || 'Default'}x${item.quantity}`)
+    const optionSummary = Object.entries(variantCounts)
+      .map(([key, quantity]) => {
+        const [priceId, color = 'Default'] = key.split('::');
+        return `${priceId}:${color}x${quantity}`;
+      })
       .join('|')
       .slice(0, 500);
 
