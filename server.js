@@ -8,6 +8,7 @@ const app    = express();
 const PORT   = process.env.PORT || 3000;
 
 const FREE_SHIPPING_THRESHOLD = 5000; // $50.00 AUD in cents
+const DEFAULT_COLORS = ['Red', 'Blue', 'Green', 'Purple', 'Pink', 'Orange', 'Yellow', 'Black'];
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
@@ -15,6 +16,49 @@ app.use(express.json());
 app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'Squish Factory backend is running 🎲' });
 });
+
+function parseProductColors(metadata = {}) {
+  const raw = metadata.colors || metadata.colours || '';
+  if (!raw) return DEFAULT_COLORS;
+
+  const parsed = String(raw)
+    .split(/[|,\/]/)
+    .map(c => c.trim())
+    .filter(Boolean)
+    .slice(0, 12);
+
+  return parsed.length ? parsed : DEFAULT_COLORS;
+}
+
+function normalizeCheckoutItems({ items, priceIds, priceId }) {
+  // New format: [{ priceId, quantity, color }]
+  if (Array.isArray(items) && items.length) {
+    return items
+      .map(item => ({
+        priceId: typeof item?.priceId === 'string' ? item.priceId.trim() : '',
+        quantity: Math.max(1, Math.min(99, Number(item?.quantity) || 1)),
+        color: typeof item?.color === 'string' ? item.color.trim().slice(0, 40) : '',
+      }))
+      .filter(item => item.priceId);
+  }
+
+  // Legacy format: duplicates in array imply quantity
+  if (Array.isArray(priceIds) && priceIds.length) {
+    const qtyCounts = {};
+    for (const id of priceIds) {
+      if (typeof id !== 'string' || !id.trim()) continue;
+      qtyCounts[id] = (qtyCounts[id] || 0) + 1;
+    }
+    return Object.entries(qtyCounts).map(([pid, quantity]) => ({ priceId: pid, quantity, color: '' }));
+  }
+
+  // Legacy format: single priceId
+  if (typeof priceId === 'string' && priceId.trim()) {
+    return [{ priceId: priceId.trim(), quantity: 1, color: '' }];
+  }
+
+  return [];
+}
 
 // ── GET /api/products ─────────────────────────────
 app.get('/api/products', async (req, res) => {
@@ -27,6 +71,7 @@ app.get('/api/products', async (req, res) => {
         image: p.images?.[0] || null, active: p.active,
         priceId: p.default_price.id, price: p.default_price.unit_amount,
         currency: p.default_price.currency, metadata: p.metadata || {},
+        colorOptions: parseProductColors(p.metadata || {}),
       }));
     res.json({ products: items });
   } catch (err) {
@@ -38,19 +83,30 @@ app.get('/api/products', async (req, res) => {
 // Body: { priceIds: ['price_xxx', ...], pickup: bool }
 // priceIds is an array so upsell items can be added
 app.post('/api/checkout', async (req, res) => {
-  const { priceIds, priceId, pickup } = req.body;
+  const { items, priceIds, priceId, pickup } = req.body;
 
-  // Support both single priceId (legacy) and array priceIds (upsell)
-  const ids = priceIds || (priceId ? [priceId] : null);
-  if (!ids || !ids.length) return res.status(400).json({ error: 'Missing priceId(s)' });
+  // Supports:
+  // - items: [{ priceId, quantity, color }]
+  // - priceIds: ['price_x', 'price_x', 'price_y'] (legacy)
+  // - priceId: 'price_x' (legacy)
+  const normalizedItems = normalizeCheckoutItems({ items, priceIds, priceId });
+  if (!normalizedItems.length) return res.status(400).json({ error: 'Missing item(s)' });
 
   try {
-    // Count quantities per price ID
+    // Count quantities per price ID for Stripe line_items
     const qtyCounts = {};
-    for (const id of ids) qtyCounts[id] = (qtyCounts[id] || 0) + 1;
+    for (const item of normalizedItems) {
+      qtyCounts[item.priceId] = (qtyCounts[item.priceId] || 0) + item.quantity;
+    }
 
     // Build line items with proper quantity (shows as "x3" in Stripe, not 3 rows)
     const line_items = Object.entries(qtyCounts).map(([price, quantity]) => ({ price, quantity }));
+
+    // Keep selected colours/quantities for order ops in metadata
+    const optionSummary = normalizedItems
+      .map(item => `${item.priceId}:${item.color || 'Default'}x${item.quantity}`)
+      .join('|')
+      .slice(0, 500);
 
     // Calculate total for free shipping check
     const uniqueIds = Object.keys(qtyCounts);
@@ -63,6 +119,9 @@ app.post('/api/checkout', async (req, res) => {
       line_items,
       success_url: process.env.SUCCESS_URL || `http://localhost:${PORT}?success=true`,
       cancel_url:  process.env.CANCEL_URL  || `http://localhost:${PORT}?canceled=true`,
+      metadata: {
+        selected_options: optionSummary,
+      },
     };
 
     if (pickup) {
