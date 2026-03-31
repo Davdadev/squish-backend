@@ -80,10 +80,10 @@ app.get('/api/products', async (req, res) => {
 });
 
 // ── POST /api/checkout ────────────────────────────
-// Body: { priceIds: ['price_xxx', ...], pickup: bool }
+// Body: { priceIds: ['price_xxx', ...], pickup: bool, discountCode: 'code' }
 // priceIds is an array so upsell items can be added
 app.post('/api/checkout', async (req, res) => {
-  const { items, priceIds, priceId, pickup } = req.body;
+  const { items, priceIds, priceId, pickup, discountCode } = req.body;
 
   // Supports:
   // - items: [{ priceId, quantity, color }]
@@ -142,6 +142,10 @@ app.post('/api/checkout', async (req, res) => {
         selected_options: optionSummary,
       },
     };
+
+    if (discountCode) {
+      sessionParams.discounts = [{ coupon: discountCode }];
+    }
 
     if (pickup) {
       // ── PICKUP: no address, no shipping ──
