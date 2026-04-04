@@ -64,15 +64,45 @@ function normalizeCheckoutItems({ items, priceIds, priceId }) {
 app.get('/api/products', async (req, res) => {
   try {
     const products = await stripe.products.list({ active: true, expand: ['data.default_price'], limit: 100 });
-    const items = products.data
-      .filter(p => p.default_price)
-      .map(p => ({
-        id: p.id, name: p.name, description: p.description || '',
-        image: p.images?.[0] || null, active: p.active,
-        priceId: p.default_price.id, price: p.default_price.unit_amount,
-        currency: p.default_price.currency, metadata: p.metadata || {},
-        colorOptions: parseProductColors(p.metadata || {}),
-      }));
+    const items = await Promise.all(
+      products.data
+        .filter(p => p.default_price)
+        .map(async p => {
+          const listedPrices = await stripe.prices.list({ product: p.id, active: true, limit: 20 });
+          const priceOptions = listedPrices.data
+            .filter(pr => pr.type === 'one_time' && Number.isInteger(pr.unit_amount))
+            .map(pr => ({
+              priceId: pr.id,
+              amount: pr.unit_amount,
+              currency: pr.currency,
+              label: String(pr.nickname || pr.metadata?.label || pr.lookup_key || '').trim(),
+            }))
+            .sort((a, b) => a.amount - b.amount);
+
+          if (!priceOptions.some(po => po.priceId === p.default_price.id)) {
+            priceOptions.unshift({
+              priceId: p.default_price.id,
+              amount: p.default_price.unit_amount,
+              currency: p.default_price.currency,
+              label: '',
+            });
+          }
+
+          return {
+            id: p.id,
+            name: p.name,
+            description: p.description || '',
+            image: p.images?.[0] || null,
+            active: p.active,
+            priceId: p.default_price.id,
+            price: p.default_price.unit_amount,
+            currency: p.default_price.currency,
+            metadata: p.metadata || {},
+            colorOptions: parseProductColors(p.metadata || {}),
+            priceOptions,
+          };
+        })
+    );
     res.json({ products: items });
   } catch (err) {
     res.status(500).json({ error: err.message });
