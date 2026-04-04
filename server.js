@@ -9,12 +9,38 @@ const PORT   = process.env.PORT || 3000;
 
 const FREE_SHIPPING_THRESHOLD = 5000; // $50.00 AUD in cents
 const DEFAULT_COLORS = ['Red', 'Blue', 'Green', 'Purple', 'Pink', 'Orange', 'Yellow', 'Black'];
+const VARIANT_PRICING_CSV_URL = (process.env.VARIANT_PRICING_CSV_URL || '').trim();
+const VARIANT_PRICING_SYNC_MS = Math.max(60_000, Number(process.env.VARIANT_PRICING_SYNC_MS) || 300_000);
+
+let variantPricingByPriceId = new Map(); // priceId -> { [color]: deltaCents }
+let variantPricingLastSyncAt = null;
+let variantPricingLastError = null;
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'Squish Factory backend is running 🎲' });
+});
+
+app.get('/api/variant-pricing/status', (req, res) => {
+  res.json({
+    enabled: Boolean(VARIANT_PRICING_CSV_URL),
+    source: VARIANT_PRICING_CSV_URL || null,
+    syncedPriceIds: variantPricingByPriceId.size,
+    lastSyncAt: variantPricingLastSyncAt,
+    lastError: variantPricingLastError,
+  });
+});
+
+app.post('/api/variant-pricing/refresh', async (req, res) => {
+  try {
+    await refreshVariantPricingFromSheet();
+    res.json({ ok: true, syncedPriceIds: variantPricingByPriceId.size, lastSyncAt: variantPricingLastSyncAt });
+  } catch (err) {
+    variantPricingLastError = err.message;
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 function parseProductColors(metadata = {}) {
@@ -28,6 +54,178 @@ function parseProductColors(metadata = {}) {
     .slice(0, 12);
 
   return parsed.length ? parsed : DEFAULT_COLORS;
+}
+
+function parseDeltaToCents(value) {
+  if (value === null || value === undefined) return 0;
+  const raw = String(value).trim();
+  if (!raw) return 0;
+
+  // Supports:
+  // - "2" or "2.50"  -> dollars
+  // - "$2"            -> dollars
+  // - "200c"          -> cents
+  const centsMatch = raw.match(/^([+-]?\d+)\s*c$/i);
+  if (centsMatch) return Number(centsMatch[1]) || 0;
+
+  const dollars = Number(raw.replace(/\$/g, ''));
+  if (!Number.isFinite(dollars)) return 0;
+  return Math.round(dollars * 100);
+}
+
+function parseColorPriceAdjustments(metadata = {}) {
+  const raw =
+    metadata.color_prices ||
+    metadata.colour_prices ||
+    metadata.color_price_adjustments ||
+    metadata.colour_price_adjustments ||
+    metadata.variant_prices ||
+    metadata.variant_pricing ||
+    '';
+
+  if (!raw) return {};
+
+  // JSON format example:
+  // {"Red":0,"Blue":2,"Glow":3.5}
+  try {
+    const parsed = JSON.parse(String(raw));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const normalized = {};
+      for (const [color, delta] of Object.entries(parsed)) {
+        const key = String(color).trim();
+        if (!key) continue;
+        normalized[key] = parseDeltaToCents(delta);
+      }
+      return normalized;
+    }
+  } catch {
+    // fall through to text parser
+  }
+
+  // Text format examples:
+  // "Red:0, Blue:2, Glow:3.5"
+  // "Red=0|Blue=2|Glow=350c"
+  const result = {};
+  const chunks = String(raw)
+    .split(/[|,\/]/)
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  for (const chunk of chunks) {
+    const [namePart, pricePart] = chunk.split(/[:=]/);
+    const color = String(namePart || '').trim();
+    if (!color) continue;
+    result[color] = parseDeltaToCents(pricePart);
+  }
+
+  return result;
+}
+
+function mergeColorAdjustments(base = {}, override = {}) {
+  return { ...(base || {}), ...(override || {}) };
+}
+
+function parseCsvLine(line) {
+  const out = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+    if (ch === ',' && !inQuotes) {
+      out.push(current.trim());
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  out.push(current.trim());
+  return out;
+}
+
+function getFirstValueByAliases(row, aliases) {
+  for (const key of aliases) {
+    const normalized = key.toLowerCase();
+    const hit = Object.entries(row).find(([k]) => k.toLowerCase() === normalized);
+    if (hit && String(hit[1] || '').trim()) return String(hit[1]).trim();
+  }
+  return '';
+}
+
+function parseVariantPricingCsv(csvText) {
+  const lines = String(csvText || '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
+
+  if (lines.length < 2) return new Map();
+
+  const headers = parseCsvLine(lines[0]);
+  const parsedRows = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const cols = parseCsvLine(lines[i]);
+    const row = {};
+    headers.forEach((h, idx) => {
+      row[h] = cols[idx] || '';
+    });
+    parsedRows.push(row);
+  }
+
+  // Required columns in spreadsheet:
+  // - price_id (or priceId)
+  // - color
+  // - adjustment (or delta / color_price)
+  const nextMap = new Map();
+
+  for (const row of parsedRows) {
+    const priceId = getFirstValueByAliases(row, ['price_id', 'priceId', 'stripe_price_id']);
+    const color = getFirstValueByAliases(row, ['color', 'colour']);
+    const adjustmentRaw = getFirstValueByAliases(row, [
+      'adjustment',
+      'delta',
+      'price_adjustment',
+      'color_price',
+      'colour_price',
+    ]);
+
+    if (!priceId || !color) continue;
+    const deltaCents = parseDeltaToCents(adjustmentRaw);
+    const existing = nextMap.get(priceId) || {};
+    existing[color] = deltaCents;
+    nextMap.set(priceId, existing);
+  }
+
+  return nextMap;
+}
+
+async function refreshVariantPricingFromSheet() {
+  if (!VARIANT_PRICING_CSV_URL) return;
+
+  const response = await fetch(VARIANT_PRICING_CSV_URL);
+  if (!response.ok) throw new Error(`Spreadsheet fetch failed: ${response.status}`);
+
+  const csvText = await response.text();
+  const parsed = parseVariantPricingCsv(csvText);
+  variantPricingByPriceId = parsed;
+  variantPricingLastSyncAt = new Date().toISOString();
+  variantPricingLastError = null;
+}
+
+function findColorDeltaCents(colorAdjustments, selectedColor) {
+  if (!selectedColor) return 0;
+  const target = String(selectedColor).trim().toLowerCase();
+  const match = Object.entries(colorAdjustments).find(([color]) => color.toLowerCase() === target);
+  return match ? Number(match[1]) || 0 : 0;
 }
 
 function normalizeCheckoutItems({ items, priceIds, priceId }) {
@@ -64,45 +262,20 @@ function normalizeCheckoutItems({ items, priceIds, priceId }) {
 app.get('/api/products', async (req, res) => {
   try {
     const products = await stripe.products.list({ active: true, expand: ['data.default_price'], limit: 100 });
-    const items = await Promise.all(
-      products.data
-        .filter(p => p.default_price)
-        .map(async p => {
-          const listedPrices = await stripe.prices.list({ product: p.id, active: true, limit: 20 });
-          const priceOptions = listedPrices.data
-            .filter(pr => pr.type === 'one_time' && Number.isInteger(pr.unit_amount))
-            .map(pr => ({
-              priceId: pr.id,
-              amount: pr.unit_amount,
-              currency: pr.currency,
-              label: String(pr.nickname || pr.metadata?.label || pr.lookup_key || '').trim(),
-            }))
-            .sort((a, b) => a.amount - b.amount);
-
-          if (!priceOptions.some(po => po.priceId === p.default_price.id)) {
-            priceOptions.unshift({
-              priceId: p.default_price.id,
-              amount: p.default_price.unit_amount,
-              currency: p.default_price.currency,
-              label: '',
-            });
-          }
-
-          return {
-            id: p.id,
-            name: p.name,
-            description: p.description || '',
-            image: p.images?.[0] || null,
-            active: p.active,
-            priceId: p.default_price.id,
-            price: p.default_price.unit_amount,
-            currency: p.default_price.currency,
-            metadata: p.metadata || {},
-            colorOptions: parseProductColors(p.metadata || {}),
-            priceOptions,
-          };
-        })
-    );
+    const items = products.data
+      .filter(p => p.default_price)
+      .map(p => {
+        const metadataAdjustments = parseColorPriceAdjustments(p.metadata || {});
+        const sheetAdjustments = variantPricingByPriceId.get(p.default_price.id) || {};
+        return {
+          id: p.id, name: p.name, description: p.description || '',
+          image: p.images?.[0] || null, active: p.active,
+          priceId: p.default_price.id, price: p.default_price.unit_amount,
+          currency: p.default_price.currency, metadata: p.metadata || {},
+          colorOptions: parseProductColors(p.metadata || {}),
+          colorPriceAdjustments: mergeColorAdjustments(metadataAdjustments, sheetAdjustments),
+        };
+      });
     res.json({ products: items });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -125,42 +298,79 @@ app.post('/api/checkout', async (req, res) => {
   try {
     // Count quantities by price + color so colour selections are preserved per item variant
     const variantCounts = {};
-    const qtyCounts = {};
-
     for (const item of normalizedItems) {
       const key = `${item.priceId}::${item.color || 'Default'}`;
       variantCounts[key] = (variantCounts[key] || 0) + item.quantity;
-      qtyCounts[item.priceId] = (qtyCounts[item.priceId] || 0) + item.quantity;
     }
 
-    // Build line items with adjustable quantities in Stripe Checkout
-    // (lets customers edit item amounts directly in checkout)
-    const line_items = Object.entries(variantCounts).map(([key, quantity]) => {
-      const [price] = key.split('::');
-      return {
-        price,
-        quantity,
-        adjustable_quantity: {
-          enabled: true,
-          minimum: 1,
-          maximum: 99,
-        },
-      };
-    });
+    const uniquePriceIds = [...new Set(normalizedItems.map(item => item.priceId))];
+    const priceMap = new Map();
+    await Promise.all(
+      uniquePriceIds.map(async (id) => {
+        const price = await stripe.prices.retrieve(id, { expand: ['product'] });
+        priceMap.set(id, price);
+      })
+    );
+
+    let totalCents = 0;
+    const line_items = [];
+
+    for (const [key, quantity] of Object.entries(variantCounts)) {
+      const [priceId, selectedColor = 'Default'] = key.split('::');
+      const price = priceMap.get(priceId);
+      if (!price) throw new Error(`Price not found: ${priceId}`);
+
+      const baseAmount = Number(price.unit_amount || 0);
+      const currency = String(price.currency || 'aud').toLowerCase();
+      const product = price.product && typeof price.product === 'object' ? price.product : null;
+      const metadataAdjustments = parseColorPriceAdjustments(product?.metadata || {});
+      const sheetAdjustments = variantPricingByPriceId.get(priceId) || {};
+      const colorAdjustments = mergeColorAdjustments(metadataAdjustments, sheetAdjustments);
+      const colorDelta = findColorDeltaCents(colorAdjustments, selectedColor);
+      const finalUnitAmount = Math.max(0, baseAmount + colorDelta);
+
+      totalCents += finalUnitAmount * quantity;
+
+      if (colorDelta === 0) {
+        line_items.push({
+          price: priceId,
+          quantity,
+          adjustable_quantity: {
+            enabled: true,
+            minimum: 1,
+            maximum: 99,
+          },
+        });
+      } else {
+        line_items.push({
+          price_data: {
+            currency,
+            unit_amount: finalUnitAmount,
+            product_data: {
+              name: `${product?.name || 'Product'} (${selectedColor})`,
+              description: product?.description || undefined,
+              images: Array.isArray(product?.images) && product.images.length ? [product.images[0]] : undefined,
+              metadata: {
+                base_price_id: priceId,
+                color: selectedColor,
+                color_price_adjustment_cents: String(colorDelta),
+              },
+            },
+          },
+          quantity,
+        });
+      }
+    }
 
     // Keep selected colours/quantities for order ops in metadata
     const optionSummary = Object.entries(variantCounts)
       .map(([key, quantity]) => {
-        const [priceId, color = 'Default'] = key.split('::');
-        return `${priceId}:${color}x${quantity}`;
+        const [variantPriceId, color = 'Default'] = key.split('::');
+        return `${variantPriceId}:${color}x${quantity}`;
       })
       .join('|')
       .slice(0, 500);
 
-    // Calculate total for free shipping check
-    const uniqueIds = Object.keys(qtyCounts);
-    const prices = await Promise.all(uniqueIds.map(id => stripe.prices.retrieve(id)));
-    const totalCents = prices.reduce((sum, p) => sum + (p.unit_amount || 0) * qtyCounts[p.id], 0);
     const qualifiesForFreeShipping = totalCents >= FREE_SHIPPING_THRESHOLD;
 
     const sessionParams = {
@@ -255,3 +465,23 @@ app.post('/api/checkout', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`\n🎲 Squish Factory running on http://localhost:${PORT}\n`);
 });
+
+if (VARIANT_PRICING_CSV_URL) {
+  refreshVariantPricingFromSheet()
+    .then(() => {
+      console.log(`✅ Variant pricing synced (${variantPricingByPriceId.size} price IDs)`);
+    })
+    .catch((err) => {
+      variantPricingLastError = err.message;
+      console.error('Variant pricing initial sync failed:', err.message);
+    });
+
+  setInterval(async () => {
+    try {
+      await refreshVariantPricingFromSheet();
+    } catch (err) {
+      variantPricingLastError = err.message;
+      console.error('Variant pricing sync failed:', err.message);
+    }
+  }, VARIANT_PRICING_SYNC_MS);
+}
