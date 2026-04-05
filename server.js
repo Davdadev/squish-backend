@@ -43,7 +43,18 @@ app.post('/api/variant-pricing/refresh', async (req, res) => {
   }
 });
 
+function parseProductColors(metadata = {}) {
+  const raw = metadata.colors || metadata.colours || '';
+  if (!raw) return DEFAULT_COLORS;
 
+  const parsed = String(raw)
+    .split(/[|,\/]/)
+    .map(c => c.trim())
+    .filter(Boolean)
+    .slice(0, 12);
+
+  return parsed.length ? parsed : DEFAULT_COLORS;
+}
 
 function parseDeltaToCents(value) {
   if (value === null || value === undefined) return 0;
