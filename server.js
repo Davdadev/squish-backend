@@ -258,6 +258,33 @@ function normalizeCheckoutItems({ items, priceIds, priceId }) {
   return [];
 }
 
+async function resolveDiscountToStripeDiscount(discountCode) {
+  const code = String(discountCode || '').trim();
+  if (!code) return null;
+
+  // Direct Stripe IDs are supported for backward compatibility
+  if (code.startsWith('promo_')) return { promotion_code: code };
+  if (code.startsWith('coupon_')) return { coupon: code };
+
+  // Most storefronts collect a human-readable promotion code
+  const promoMatches = await stripe.promotionCodes.list({ code, active: true, limit: 1 });
+  if (promoMatches?.data?.length) {
+    return { promotion_code: promoMatches.data[0].id };
+  }
+
+  // Fall back to coupon ID (some setups expose simple coupon IDs to users)
+  try {
+    const coupon = await stripe.coupons.retrieve(code);
+    if (coupon && !coupon.deleted && coupon.valid) {
+      return { coupon: coupon.id };
+    }
+  } catch {
+    // Ignore and return null below
+  }
+
+  return null;
+}
+
 // ── GET /api/products ─────────────────────────────
 app.get('/api/products', async (req, res) => {
   try {
@@ -283,7 +310,7 @@ app.get('/api/products', async (req, res) => {
 });
 
 // ── POST /api/checkout ────────────────────────────
-// Body: { priceIds: ['price_xxx', ...], pickup: bool, discountCode: 'code' }
+// Body: { priceIds: ['price_xxx', ...], pickup: bool, discountCode: 'PROMO_CODE' }
 // priceIds is an array so upsell items can be added
 app.post('/api/checkout', async (req, res) => {
   const { items, priceIds, priceId, pickup, discountCode } = req.body;
@@ -378,13 +405,19 @@ app.post('/api/checkout', async (req, res) => {
       line_items,
       success_url: process.env.SUCCESS_URL || `http://localhost:${PORT}?success=true`,
       cancel_url:  process.env.CANCEL_URL  || `http://localhost:${PORT}?canceled=true`,
+      allow_promotion_codes: true,
       metadata: {
         selected_options: optionSummary,
       },
     };
 
     if (discountCode) {
-      sessionParams.discounts = [{ coupon: discountCode }];
+      const resolvedDiscount = await resolveDiscountToStripeDiscount(discountCode);
+      if (!resolvedDiscount) {
+        return res.status(400).json({ error: 'Invalid discount code' });
+      }
+      sessionParams.discounts = [resolvedDiscount];
+      sessionParams.allow_promotion_codes = false;
     }
 
     if (pickup) {
