@@ -11,6 +11,7 @@ const FREE_SHIPPING_THRESHOLD = 5000; // $50.00 AUD in cents
 const DEFAULT_COLORS = ['Red', 'Blue', 'Green', 'Purple', 'Pink', 'Orange', 'Yellow', 'Black'];
 const VARIANT_PRICING_CSV_URL = (process.env.VARIANT_PRICING_CSV_URL || '').trim();
 const VARIANT_PRICING_SYNC_MS = Math.max(60_000, Number(process.env.VARIANT_PRICING_SYNC_MS) || 300_000);
+const FRONTEND_BASE_URL = (process.env.FRONTEND_BASE_URL || 'https://3dfidgets.shop').replace(/\/+$/, '');
 
 let variantPricingByPriceId = new Map(); // priceId -> { [color]: deltaCents }
 let variantPricingLastSyncAt = null;
@@ -284,6 +285,89 @@ async function resolveDiscountToStripeDiscount(discountCode) {
 
   return null;
 }
+
+function xmlEscape(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function toStorefrontProductUrl(priceId) {
+  return `${FRONTEND_BASE_URL}/checkout.html?priceId=${encodeURIComponent(priceId)}&pickup=false`;
+}
+
+async function listCatalogForSeo() {
+  const products = await stripe.products.list({ active: true, expand: ['data.default_price'], limit: 100 });
+
+  return products.data
+    .filter(p => p.default_price)
+    .map((p) => ({
+      id: p.id,
+      priceId: p.default_price.id,
+      name: p.name || '3D Printed Fidget',
+      description: p.description || '',
+      image: p.images?.[0] || null,
+      currency: String(p.default_price.currency || 'aud').toUpperCase(),
+      price: Number(p.default_price.unit_amount || 0),
+      active: Boolean(p.active),
+      url: toStorefrontProductUrl(p.default_price.id),
+    }));
+}
+
+app.get('/api/seo/product-feed.json', async (req, res) => {
+  try {
+    const items = await listCatalogForSeo();
+    res.json({
+      ok: true,
+      generatedAt: new Date().toISOString(),
+      baseUrl: FRONTEND_BASE_URL,
+      products: items,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/seo/image-sitemap.xml', async (req, res) => {
+  try {
+    const items = await listCatalogForSeo();
+    const nowIso = new Date().toISOString();
+
+    const urlEntries = items
+      .filter(item => item.image)
+      .map((item) => {
+        const title = xmlEscape(item.name);
+        const caption = xmlEscape(item.description || item.name);
+        return [
+          '  <url>',
+          `    <loc>${xmlEscape(item.url)}</loc>`,
+          `    <lastmod>${nowIso}</lastmod>`,
+          '    <image:image>',
+          `      <image:loc>${xmlEscape(item.image)}</image:loc>`,
+          `      <image:title>${title}</image:title>`,
+          `      <image:caption>${caption}</image:caption>`,
+          '    </image:image>',
+          '  </url>',
+        ].join('\n');
+      })
+      .join('\n');
+
+    const xml = [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">',
+      urlEntries,
+      '</urlset>',
+    ].join('\n');
+
+    res.set('Content-Type', 'application/xml; charset=utf-8');
+    res.send(xml);
+  } catch (err) {
+    res.status(500).type('text/plain').send(`sitemap error: ${err.message}`);
+  }
+});
 
 // ── GET /api/products ─────────────────────────────
 app.get('/api/products', async (req, res) => {
