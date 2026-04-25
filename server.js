@@ -62,7 +62,7 @@ function parseDeltaToCents(value) {
   const raw = String(value).trim();
   if (!raw) return 0;
 
-  // Supports:
+  // ...existing code...
   // - "2" or "2.50"  -> dollars
   // - "$2"            -> dollars
   // - "200c"          -> cents
