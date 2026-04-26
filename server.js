@@ -487,8 +487,8 @@ app.post('/api/checkout', async (req, res) => {
     const sessionParams = {
       mode: 'payment',
       line_items,
-      success_url: process.env.SUCCESS_URL || `${FRONTEND_BASE_URL}/index.html?success=true`,
-      cancel_url:  process.env.CANCEL_URL  || `${FRONTEND_BASE_URL}/index.html?canceled=true`,
+      success_url: process.env.SUCCESS_URL || `http://localhost:${PORT}?success=true`,
+      cancel_url:  process.env.CANCEL_URL  || `http://localhost:${PORT}?canceled=true`,
       allow_promotion_codes: true,
       metadata: {
         selected_options: optionSummary,
