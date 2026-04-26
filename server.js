@@ -397,7 +397,7 @@ app.get('/api/products', async (req, res) => {
 // Body: { priceIds: ['price_xxx', ...], pickup: bool, discountCode: 'PROMO_CODE' }
 // priceIds is an array so upsell items can be added
 app.post('/api/checkout', async (req, res) => {
-  const { items, priceIds, priceId, pickup, discountCode } = req.body;
+  const { items, priceIds, priceId, pickup, discountCode, referral } = req.body;
 
   // Supports:
   // - items: [{ priceId, quantity, color }]
@@ -492,6 +492,7 @@ app.post('/api/checkout', async (req, res) => {
       allow_promotion_codes: true,
       metadata: {
         selected_options: optionSummary,
+        ...(referral ? { referral } : {}),
       },
     };
 
