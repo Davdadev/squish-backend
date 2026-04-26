@@ -13,7 +13,7 @@ const VARIANT_PRICING_CSV_URL = (process.env.VARIANT_PRICING_CSV_URL || '').trim
 const VARIANT_PRICING_SYNC_MS = Math.max(60_000, Number(process.env.VARIANT_PRICING_SYNC_MS) || 300_000);
 const FRONTEND_BASE_URL = (process.env.FRONTEND_BASE_URL || 'https://3dfidgets.shop').replace(/\/+$/, '');
 
-let variantPricingByPriceId = new Map(); // priceId -> { [color]: deltaCents }
+let variantPricingByPriceId = new Map();
 let variantPricingLastSyncAt = null;
 let variantPricingLastError = null;
 
@@ -47,13 +47,7 @@ app.post('/api/variant-pricing/refresh', async (req, res) => {
 function parseProductColors(metadata = {}) {
   const raw = metadata.colors || metadata.colours || '';
   if (!raw) return DEFAULT_COLORS;
-
-  const parsed = String(raw)
-    .split(/[|,\/]/)
-    .map(c => c.trim())
-    .filter(Boolean)
-    .slice(0, 12);
-
+  const parsed = String(raw).split(/[|,\/]/).map(c => c.trim()).filter(Boolean).slice(0, 12);
   return parsed.length ? parsed : DEFAULT_COLORS;
 }
 
@@ -61,14 +55,8 @@ function parseDeltaToCents(value) {
   if (value === null || value === undefined) return 0;
   const raw = String(value).trim();
   if (!raw) return 0;
-
-  // ...existing code...
-  // - "2" or "2.50"  -> dollars
-  // - "$2"            -> dollars
-  // - "200c"          -> cents
   const centsMatch = raw.match(/^([+-]?\d+)\s*c$/i);
   if (centsMatch) return Number(centsMatch[1]) || 0;
-
   const dollars = Number(raw.replace(/\$/g, ''));
   if (!Number.isFinite(dollars)) return 0;
   return Math.round(dollars * 100);
@@ -86,8 +74,6 @@ function parseColorPriceAdjustments(metadata = {}) {
 
   if (!raw) return {};
 
-  // JSON format example:
-  // {"Red":0,"Blue":2,"Glow":3.5}
   try {
     const parsed = JSON.parse(String(raw));
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
@@ -103,22 +89,14 @@ function parseColorPriceAdjustments(metadata = {}) {
     // fall through to text parser
   }
 
-  // Text format examples:
-  // "Red:0, Blue:2, Glow:3.5"
-  // "Red=0|Blue=2|Glow=350c"
   const result = {};
-  const chunks = String(raw)
-    .split(/[|,\/]/)
-    .map(s => s.trim())
-    .filter(Boolean);
-
+  const chunks = String(raw).split(/[|,\/]/).map(s => s.trim()).filter(Boolean);
   for (const chunk of chunks) {
     const [namePart, pricePart] = chunk.split(/[:=]/);
     const color = String(namePart || '').trim();
     if (!color) continue;
     result[color] = parseDeltaToCents(pricePart);
   }
-
   return result;
 }
 
@@ -130,23 +108,14 @@ function parseCsvLine(line) {
   const out = [];
   let current = '';
   let inQuotes = false;
-
   for (let i = 0; i < line.length; i++) {
     const ch = line[i];
     if (ch === '"') {
-      if (inQuotes && line[i + 1] === '"') {
-        current += '"';
-        i += 1;
-      } else {
-        inQuotes = !inQuotes;
-      }
+      if (inQuotes && line[i + 1] === '"') { current += '"'; i += 1; }
+      else { inQuotes = !inQuotes; }
       continue;
     }
-    if (ch === ',' && !inQuotes) {
-      out.push(current.trim());
-      current = '';
-      continue;
-    }
+    if (ch === ',' && !inQuotes) { out.push(current.trim()); current = ''; continue; }
     current += ch;
   }
   out.push(current.trim());
@@ -163,58 +132,34 @@ function getFirstValueByAliases(row, aliases) {
 }
 
 function parseVariantPricingCsv(csvText) {
-  const lines = String(csvText || '')
-    .split(/\r?\n/)
-    .map(line => line.trim())
-    .filter(Boolean);
-
+  const lines = String(csvText || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
   if (lines.length < 2) return new Map();
-
   const headers = parseCsvLine(lines[0]);
   const parsedRows = [];
-
   for (let i = 1; i < lines.length; i++) {
     const cols = parseCsvLine(lines[i]);
     const row = {};
-    headers.forEach((h, idx) => {
-      row[h] = cols[idx] || '';
-    });
+    headers.forEach((h, idx) => { row[h] = cols[idx] || ''; });
     parsedRows.push(row);
   }
-
-  // Required columns in spreadsheet:
-  // - price_id (or priceId)
-  // - color
-  // - adjustment (or delta / color_price)
   const nextMap = new Map();
-
   for (const row of parsedRows) {
     const priceId = getFirstValueByAliases(row, ['price_id', 'priceId', 'stripe_price_id']);
     const color = getFirstValueByAliases(row, ['color', 'colour']);
-    const adjustmentRaw = getFirstValueByAliases(row, [
-      'adjustment',
-      'delta',
-      'price_adjustment',
-      'color_price',
-      'colour_price',
-    ]);
-
+    const adjustmentRaw = getFirstValueByAliases(row, ['adjustment', 'delta', 'price_adjustment', 'color_price', 'colour_price']);
     if (!priceId || !color) continue;
     const deltaCents = parseDeltaToCents(adjustmentRaw);
     const existing = nextMap.get(priceId) || {};
     existing[color] = deltaCents;
     nextMap.set(priceId, existing);
   }
-
   return nextMap;
 }
 
 async function refreshVariantPricingFromSheet() {
   if (!VARIANT_PRICING_CSV_URL) return;
-
   const response = await fetch(VARIANT_PRICING_CSV_URL);
   if (!response.ok) throw new Error(`Spreadsheet fetch failed: ${response.status}`);
-
   const csvText = await response.text();
   const parsed = parseVariantPricingCsv(csvText);
   variantPricingByPriceId = parsed;
@@ -230,7 +175,6 @@ function findColorDeltaCents(colorAdjustments, selectedColor) {
 }
 
 function normalizeCheckoutItems({ items, priceIds, priceId }) {
-  // New format: [{ priceId, quantity, color }]
   if (Array.isArray(items) && items.length) {
     return items
       .map(item => ({
@@ -240,8 +184,6 @@ function normalizeCheckoutItems({ items, priceIds, priceId }) {
       }))
       .filter(item => item.priceId);
   }
-
-  // Legacy format: duplicates in array imply quantity
   if (Array.isArray(priceIds) && priceIds.length) {
     const qtyCounts = {};
     for (const id of priceIds) {
@@ -250,49 +192,16 @@ function normalizeCheckoutItems({ items, priceIds, priceId }) {
     }
     return Object.entries(qtyCounts).map(([pid, quantity]) => ({ priceId: pid, quantity, color: '' }));
   }
-
-  // Legacy format: single priceId
   if (typeof priceId === 'string' && priceId.trim()) {
     return [{ priceId: priceId.trim(), quantity: 1, color: '' }];
   }
-
   return [];
-}
-
-async function resolveDiscountToStripeDiscount(discountCode) {
-  const code = String(discountCode || '').trim();
-  if (!code) return null;
-
-  // Direct Stripe IDs are supported for backward compatibility
-  if (code.startsWith('promo_')) return { promotion_code: code };
-  if (code.startsWith('coupon_')) return { coupon: code };
-
-  // Most storefronts collect a human-readable promotion code
-  const promoMatches = await stripe.promotionCodes.list({ code, active: true, limit: 1 });
-  if (promoMatches?.data?.length) {
-    return { promotion_code: promoMatches.data[0].id };
-  }
-
-  // Fall back to coupon ID (some setups expose simple coupon IDs to users)
-  try {
-    const coupon = await stripe.coupons.retrieve(code);
-    if (coupon && !coupon.deleted && coupon.valid) {
-      return { coupon: coupon.id };
-    }
-  } catch {
-    // Ignore and return null below
-  }
-
-  return null;
 }
 
 function xmlEscape(value) {
   return String(value ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
 function toStorefrontProductUrl(priceId) {
@@ -301,7 +210,6 @@ function toStorefrontProductUrl(priceId) {
 
 async function listCatalogForSeo() {
   const products = await stripe.products.list({ active: true, expand: ['data.default_price'], limit: 100 });
-
   return products.data
     .filter(p => p.default_price)
     .map((p) => ({
@@ -320,12 +228,7 @@ async function listCatalogForSeo() {
 app.get('/api/seo/product-feed.json', async (req, res) => {
   try {
     const items = await listCatalogForSeo();
-    res.json({
-      ok: true,
-      generatedAt: new Date().toISOString(),
-      baseUrl: FRONTEND_BASE_URL,
-      products: items,
-    });
+    res.json({ ok: true, generatedAt: new Date().toISOString(), baseUrl: FRONTEND_BASE_URL, products: items });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -335,33 +238,26 @@ app.get('/api/seo/image-sitemap.xml', async (req, res) => {
   try {
     const items = await listCatalogForSeo();
     const nowIso = new Date().toISOString();
-
     const urlEntries = items
       .filter(item => item.image)
-      .map((item) => {
-        const title = xmlEscape(item.name);
-        const caption = xmlEscape(item.description || item.name);
-        return [
-          '  <url>',
-          `    <loc>${xmlEscape(item.url)}</loc>`,
-          `    <lastmod>${nowIso}</lastmod>`,
-          '    <image:image>',
-          `      <image:loc>${xmlEscape(item.image)}</image:loc>`,
-          `      <image:title>${title}</image:title>`,
-          `      <image:caption>${caption}</image:caption>`,
-          '    </image:image>',
-          '  </url>',
-        ].join('\n');
-      })
+      .map((item) => [
+        '  <url>',
+        `    <loc>${xmlEscape(item.url)}</loc>`,
+        `    <lastmod>${nowIso}</lastmod>`,
+        '    <image:image>',
+        `      <image:loc>${xmlEscape(item.image)}</image:loc>`,
+        `      <image:title>${xmlEscape(item.name)}</image:title>`,
+        `      <image:caption>${xmlEscape(item.description || item.name)}</image:caption>`,
+        '    </image:image>',
+        '  </url>',
+      ].join('\n'))
       .join('\n');
-
     const xml = [
       '<?xml version="1.0" encoding="UTF-8"?>',
       '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">',
       urlEntries,
       '</urlset>',
     ].join('\n');
-
     res.set('Content-Type', 'application/xml; charset=utf-8');
     res.send(xml);
   } catch (err) {
@@ -394,20 +290,18 @@ app.get('/api/products', async (req, res) => {
 });
 
 // ── POST /api/checkout ────────────────────────────
-// Body: { priceIds: ['price_xxx', ...], pickup: bool, discountCode: 'PROMO_CODE' }
-// priceIds is an array so upsell items can be added
+// Coupons/promo codes are handled natively by Stripe Checkout via allow_promotion_codes: true
+// Customers will see a "Add promotion code" field on the Stripe-hosted payment page
 app.post('/api/checkout', async (req, res) => {
-  const { items, priceIds, priceId, pickup, discountCode, referral } = req.body;
+  const { items, priceIds, priceId, pickup, referral } = req.body;
 
-  // Supports:
-  // - items: [{ priceId, quantity, color }]
-  // - priceIds: ['price_x', 'price_x', 'price_y'] (legacy)
-  // - priceId: 'price_x' (legacy)
+  console.log('=== CHECKOUT REQUEST ===');
+  console.log('referral received:', referral);
+
   const normalizedItems = normalizeCheckoutItems({ items, priceIds, priceId });
   if (!normalizedItems.length) return res.status(400).json({ error: 'Missing item(s)' });
 
   try {
-    // Count quantities by price + color so colour selections are preserved per item variant
     const variantCounts = {};
     for (const item of normalizedItems) {
       const key = `${item.priceId}::${item.color || 'Default'}`;
@@ -446,11 +340,7 @@ app.post('/api/checkout', async (req, res) => {
         line_items.push({
           price: priceId,
           quantity,
-          adjustable_quantity: {
-            enabled: true,
-            minimum: 1,
-            maximum: 99,
-          },
+          adjustable_quantity: { enabled: true, minimum: 1, maximum: 99 },
         });
       } else {
         line_items.push({
@@ -473,7 +363,6 @@ app.post('/api/checkout', async (req, res) => {
       }
     }
 
-    // Keep selected colours/quantities for order ops in metadata
     const optionSummary = Object.entries(variantCounts)
       .map(([key, quantity]) => {
         const [variantPriceId, color = 'Default'] = key.split('::');
@@ -489,24 +378,16 @@ app.post('/api/checkout', async (req, res) => {
       line_items,
       success_url: process.env.SUCCESS_URL || `http://localhost:${PORT}?success=true`,
       cancel_url:  process.env.CANCEL_URL  || `http://localhost:${PORT}?canceled=true`,
+      // Enables the "Add promotion code" field natively inside Stripe Checkout.
+      // Create coupons/promo codes in your Stripe Dashboard → Coupons.
       allow_promotion_codes: true,
       metadata: {
         selected_options: optionSummary,
-        ...(referral ? { referral } : {}),
+        referral: referral || '',
       },
     };
 
-    if (discountCode) {
-      const resolvedDiscount = await resolveDiscountToStripeDiscount(discountCode);
-      if (!resolvedDiscount) {
-        return res.status(400).json({ error: 'Invalid discount code' });
-      }
-      sessionParams.discounts = [resolvedDiscount];
-      sessionParams.allow_promotion_codes = false;
-    }
-
     if (pickup) {
-      // ── PICKUP: no address, no shipping ──
       sessionParams.custom_fields = [{
         key: 'pickup_note',
         label: { type: 'custom', custom: 'Pickup location' },
@@ -514,11 +395,8 @@ app.post('/api/checkout', async (req, res) => {
         text: { default_value: "email me at david.sebbag2010@gmail.com" },
       }];
     } else {
-      // ── DELIVERY: address + shipping options ──
       sessionParams.shipping_address_collection = { allowed_countries: ['AU'] };
-
       if (qualifiesForFreeShipping) {
-        // Order is $50+ — offer free standard, discounted express
         sessionParams.shipping_options = [
           {
             shipping_rate_data: {
@@ -544,7 +422,6 @@ app.post('/api/checkout', async (req, res) => {
           },
         ];
       } else {
-        // Under $50 — standard $10, express $15
         sessionParams.shipping_options = [
           {
             shipping_rate_data: {
