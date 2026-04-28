@@ -293,8 +293,8 @@ app.get('/api/products', async (req, res) => {
 // Coupons/promo codes are handled natively by Stripe Checkout via allow_promotion_codes: true
 // Customers will see a "Add promotion code" field on the Stripe-hosted payment page
 app.post('/api/checkout', async (req, res) => {
-  const { items, priceIds, priceId, pickup, referral } = req.body;
-
+const { items, priceIds, priceId, referral } = req.body;
+const pickup = req.body.pickup === true || req.body.pickup === 'true';
   console.log('=== CHECKOUT REQUEST ===');
   console.log('referral received:', referral);
 
