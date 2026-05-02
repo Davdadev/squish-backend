@@ -373,19 +373,22 @@ const pickup = req.body.pickup === true || req.body.pickup === 'true';
 
     const qualifiesForFreeShipping = totalCents >= FREE_SHIPPING_THRESHOLD;
 
-    const sessionParams = {
-      mode: 'payment',
-      line_items,
-      success_url: process.env.SUCCESS_URL || `http://localhost:${PORT}?success=true`,
-      cancel_url:  process.env.CANCEL_URL  || `http://localhost:${PORT}?canceled=true`,
-      // Enables the "Add promotion code" field natively inside Stripe Checkout.
-      // Create coupons/promo codes in your Stripe Dashboard → Coupons.
-      allow_promotion_codes: true,
-      metadata: {
-        selected_options: optionSummary,
-        referral: referral || '',
-      },
-    };
+    const sharedMetadata = {
+  selected_options: optionSummary,
+  referral: referral || '',
+};
+
+const sessionParams = {
+  mode: 'payment',
+  line_items,
+  success_url: process.env.SUCCESS_URL || `http://localhost:${PORT}?success=true`,
+  cancel_url:  process.env.CANCEL_URL  || `http://localhost:${PORT}?canceled=true`,
+  allow_promotion_codes: true,
+  metadata: sharedMetadata,          // visible under Checkout Sessions
+  payment_intent_data: {
+    metadata: sharedMetadata,        // ← THIS is what shows under Payments in Stripe Dashboard
+  },
+};
 
     if (pickup) {
       sessionParams.custom_fields = [{
